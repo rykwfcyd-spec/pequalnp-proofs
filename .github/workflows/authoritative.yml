@@ -37,6 +37,10 @@ on:
         description: Leave empty (the checker on two cores, as always). "all" runs a proof or a refutation on every core of the runner; only our own hand dispatches send it (rehearsal of the all-cores change).
         required: false
         type: string
+      read:
+        description: 'Leave empty. "on" also runs the read job (the runner reader''s receipt). Off unless the intake''s runner_reader switch or a rehearsal asks for it.'
+        required: false
+        type: string
       open_claims:
         description: 'For a reduction only, from the intake: a JSON list of the open pull requests of the same step inside the stale window, [{number, createdAt, author, files}], author the intake 12-hex hash of the sender or null, never a login (an empty list is no claims). A reduction run without it is a FAULT.'
         required: false
@@ -61,6 +65,11 @@ jobs:
     # anything else falls to the repository variable if it is on the list, and otherwise to the standard runner.
     runs-on: ${{ contains(fromJSON('["pnp-4core","pnp-8core","pnp-2core"]'), inputs.pool) && inputs.pool || (inputs.pool != 'standard' && contains(fromJSON('["pnp-4core","pnp-8core","pnp-2core"]'), vars.CHECK_RUNNER) && vars.CHECK_RUNNER || 'ubuntu-24.04') }}
     timeout-minutes: 150
+    # THE CHECK RECORD (27 Nov, red team 14:20Z/14:21Z): one bounded line the verdict step writes ONLY on ACCEPTED, from
+    # values this job validated or computed before the outside step (the read job takes it through needs, bound by
+    # Actions to this job of the same attempt; the intake never reads this job's log for it).
+    outputs:
+      record: ${{ steps.verdict.outputs.record }}
     env:
       # Inputs are free text typed by whoever starts the run. They reach the scripts only as
       # environment variables, and the next step refuses anything but digits and a plain id.
@@ -593,11 +602,13 @@ jobs:
           echo "code=$code" >> "$GITHUB_OUTPUT"
 
       - name: Print the checker's last line, MANIFEST, and the verdict
+        id: verdict
         # Always: whatever stopped the run, its last step says why in one place.
         if: always()
         env:
           CODE: ${{ steps.run.outputs.code }}
           RAN: ${{ steps.run.outcome }}
+          READ: ${{ inputs.read }}
         run: |
           # SECOND WALL: the system's own tools only, whatever the build left on the runner's PATH.
           export PATH=/usr/bin:/bin
@@ -746,6 +757,118 @@ jobs:
             1) case "$last" in REJECTED*) verdict=REJECTED ;; esac ;;
           esac
           echo "VERDICT: $verdict (checker exit $CODE)" | tee -a "$GITHUB_STEP_SUMMARY"
-          [ "$verdict" = ACCEPTED ] && exit 0
+          # RECORD BLOCK START (tools/read-decision.test.py runs this text). With read off nothing runs between the
+          # VERDICT line and the exit: the accepted branch is the old one. With read on, the check record is written in a
+          # subshell with errexit off, its output redirection inside it, and "|| true" after it, so no failure in it can
+          # change the step's exit; a missing or empty record means no receipt (tools/read-receipt.sh refuses it).
+          if [ "$verdict" = ACCEPTED ]; then
+            if [ "${READ:-}" = on ]; then
+              ( set +e
+                # Only validated or before-the-outside-step values, and digests of exactly the lines this step prints for
+                # the hub (each without its "  | ", with one newline): the MANIFEST line(s), the CHILD lines and their
+                # count, and the last line as the "last line" section prints it.
+                if printf '%s %s %s %s' "$fsha" "$ssha" "$(cat "$W/in/pr.head")" "$(cat "$W/in/pr.blob")" | grep -Eqx '[0-9a-f]{64} [0-9a-f]{64} [0-9a-f]{40} [0-9a-f]{40}'; then
+                  msha=$(grep -a '^MANIFEST {' "$RUNNER_TEMP/checker.out" | cut -c1-200000 | sha256sum | cut -d' ' -f1)
+                  csha=$(grep -a '^CHILD ' "$RUNNER_TEMP/checker.out" | tr -d '\000-\010\013-\037\177' | cut -c1-8200 | sha256sum | cut -d' ' -f1)
+                  lsha=$(printf '%s\n' "$last" | tr -d '\000-\010\013-\037\177' | cut -c1-2000 | sha256sum | cut -d' ' -f1)
+                  rec=$(jq -cnS --argjson pr "$PR" --arg gap "$GAP" --arg kind "$(cat "$W/in/gap.kind")" --arg file "$file" \
+                    --arg head "$(cat "$W/in/pr.head")" --arg blob "$(cat "$W/in/pr.blob")" --arg f "$fsha" --arg s "$ssha" \
+                    --arg m "$msha" --argjson n "${children:-0}" --arg c "$csha" --arg l "$lsha" \
+                    '{pr: $pr, gap: $gap, kind: $kind, file: $file, head: $head, blob: $blob, file_sha256: $f, statement_sha256: $s,
+                      manifest_sha256: $m, children: $n, children_sha256: $c, last_sha256: $l, verdict: "ACCEPTED"}')
+                  [ -n "$rec" ] && printf 'record=%s\n' "$rec" >> "$GITHUB_OUTPUT"
+                fi
+              ) || true
+            fi
+            exit 0
+          fi
+          # RECORD BLOCK END
           [ "$verdict" = REJECTED ] && exit 1
           exit 3
+
+  # THE READER, A JOB OF ITS OWN (27 Nov; red team decisions 13:54Z/13:55Z, reviews 14:20Z/14:21Z). The intake lands an
+  # accepted file only on this job's RECEIPT and never holds the file's bytes. This job runs on its own fresh runner after
+  # the check job, never runs contributor code, and shares no workspace, cache, credential or artifact with it: from the
+  # check job it takes only the bounded check record (its output, bound by Actions to that job of this attempt), and
+  # issues no receipt unless that record is ACCEPTED and names the same pull request, head, file and blob this job read
+  # for itself. The parse runs through tools/read-parse.sh in tools/read-sandbox.sh: a clean environment, nobody, no
+  # network, a restricted root holding only /usr (read only), the jail (a read-only copy of the two classifier files and
+  # the one blob, the working directory), /proc and a small /tmp, limits; a nonzero status is a fixed ERROR hold. The RECEIPT is ONE canonical JSON line in this job's own log, "READ-RECEIPT <json>", whose
+  # fields are numbers, hashes, ids this job validated, or words of the closed vocabulary; it names the git objects of
+  # every producer file at this base, which the intake checks against the base and a reviewed allowlist. Nothing the
+  # pull request wrote is printed: the guard's words go to a file.
+  read:
+    needs: check
+    # Only when asked (input read = on): until the rehearsal and the red team clear it, no contributor file is read here.
+    if: success() && inputs.read == 'on'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      PR: ${{ inputs.pr }}
+      GAP: ${{ inputs.gap }}
+      CHECK_RECORD: ${{ needs.check.outputs.record }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      API: https://api.github.com
+      W: /opt/pnp-read
+    steps:
+      - name: Refuse malformed inputs and a run from another branch
+        run: |
+          set -eu
+          printf '%s' "$PR" | grep -Eqx '[1-9][0-9]{0,6}' || { echo "READ-JOB: pr must be a number; no receipt"; exit 1; }
+          printf '%s' "$GAP" | grep -Eqx 'L-[a-z0-9]+(-[a-z0-9]+)*' || { echo "READ-JOB: malformed gap; no receipt"; exit 1; }
+          [ "${#GAP}" -le 64 ] || { echo "READ-JOB: gap id too long; no receipt"; exit 1; }
+          [ "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH" ] || { echo "READ-JOB: start this run from $DEFAULT_BRANCH; no receipt"; exit 1; }
+          sudo mkdir -p "$W" && sudo chown "$(id -u):$(id -g)" "$W" && chmod 755 "$W"
+          mkdir -p "$W/in" "$W/api" "$W/rd"
+
+      - name: Check out the BASE only (plain git, no stored credentials)
+        run: |
+          set -eu
+          git init -q "$W/base"
+          git -C "$W/base" fetch -q --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
+          git -C "$W/base" checkout -q --detach FETCH_HEAD
+          [ "$(git -C "$W/base" rev-parse HEAD)" = "$GITHUB_SHA" ]
+
+      - name: Read the pull request's identity and fetch the one file as data
+        env:
+          GH_TOKEN: ${{ github.token }}   # read only, this step alone
+        run: |
+          set -eu
+          get() { curl -sSf --proto '=https' --max-redirs 0 --max-filesize 20000000 \
+                    -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                    -H "X-GitHub-Api-Version: 2022-11-28" -o "$2" "$API/repos/$GITHUB_REPOSITORY/$1"; }
+          get "pulls/$PR" "$W/api/pr.json"
+          get "pulls/$PR/files?per_page=100" "$W/api/files.json"
+          head=$(jq -r '.head.sha // ""' "$W/api/pr.json")
+          printf '%s' "$head" | grep -Eqx '[0-9a-f]{40}' || { echo "READ-JOB: no head commit; no receipt"; exit 1; }
+          get "git/trees/$head?recursive=1" "$W/api/tree.json"
+          node "$W/base/.github/scripts/outside-guard.mjs" pr "$W/api/pr.json" "$W/api/files.json" "$W/api/tree.json" \
+            "$GITHUB_REPOSITORY" "$DEFAULT_BRANCH" "$W/in" > "$W/api/guard.out" 2>&1 \
+            && [ "$(tail -n 1 "$W/api/guard.out")" = "GUARD OK: pr" ] \
+            || { echo "READ-JOB: the pull request did not pass the guard; no receipt"; exit 1; }
+          blob=$(cat "$W/in/pr.blob")
+          printf '%s' "$blob" | grep -Eqx '[0-9a-f]{40}' || { echo "READ-JOB: no content hash; no receipt"; exit 1; }
+          curl -sSf --proto '=https' --max-redirs 0 --max-filesize 524288 \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" -o "$W/rd/proof.lean" "$API/repos/$GITHUB_REPOSITORY/git/blobs/$blob"
+          [ "$(wc -c < "$W/rd/proof.lean")" -le 524288 ] || { echo "READ-JOB: larger than 512 KiB; no receipt"; exit 1; }
+          [ "$(git hash-object "$W/rd/proof.lean")" = "$blob" ] || { echo "READ-JOB: the bytes are not the named blob; no receipt"; exit 1; }
+          chmod 0444 "$W/rd/proof.lean"
+
+      - name: Read the file as data (tools/read-parse.sh, tools/read-sandbox.sh)
+        run: |
+          # The parse's status is taken by an explicit conditional inside read-parse.sh (this shell runs with errexit),
+          # and anything but 0 discards the output: tools/read-receipt.sh then issues the fixed HOLD with ERROR.
+          judge=$(git -C "$W/base" rev-parse HEAD:tools/check-lean.mjs)
+          bash "$W/base/tools/read-parse.sh" "$W/base/tools" "$W/rd/proof.lean" "$judge" "$W/rd"
+
+      - name: Check the decision and print the receipt
+        run: |
+          set -eu
+          export PATH=/usr/bin:/bin
+          # tools/read-receipt.sh: a nonzero parse status or any line outside the closed vocabulary becomes the fixed
+          # HOLD with ERROR; the check record must be ACCEPTED and name this job's own identity, or no receipt is made.
+          bash "$W/base/tools/read-receipt.sh" "$W/rd/decision.json" "$W/rd/status" "$W/rd/proof.lean" "$W/in" "$W/base"

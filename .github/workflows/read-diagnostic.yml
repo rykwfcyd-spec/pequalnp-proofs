@@ -1,0 +1,58 @@
+# Manual read diagnostics. The default and the v2 rehearsal use only team fixtures.
+# Private replay requires the reviewed receipt commitment in the pinned publisher.
+name: read-diagnostic
+
+on:
+  workflow_dispatch:
+    inputs:
+      diagnostic:
+        description: Select the reader diagnostic
+        type: choice
+        default: existing
+        options:
+          - existing
+          - col0-v2-fixtures
+          - col0-v2
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    if: inputs.diagnostic != 'col0-v2'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - &checkout
+        name: Check out the pinned diagnostic tools
+        run: |
+          set -eu
+          git init -q "$RUNNER_TEMP/base"
+          git -C "$RUNNER_TEMP/base" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -C "$RUNNER_TEMP/base" config remote.origin.promisor true
+          git -C "$RUNNER_TEMP/base" sparse-checkout set --no-cone '/tools/' '/.github/'
+          git -C "$RUNNER_TEMP/base" fetch -q --filter=blob:none --depth 1 origin "$GITHUB_SHA"
+          git -C "$RUNNER_TEMP/base" checkout -q --detach FETCH_HEAD
+      - name: Run the diagnostic on team-authored files
+        if: inputs.diagnostic == 'existing' || inputs.diagnostic == ''
+        run: bash "$RUNNER_TEMP/base/tools/read-diagnostic.sh" "$RUNNER_TEMP/base"
+      - name: Rehearse the frozen v2 histogram on team files
+        if: inputs.diagnostic == 'col0-v2-fixtures'
+        run: |
+          set -eu
+          out="$RUNNER_TEMP/team-histogram"
+          python3 -I -B -S "$RUNNER_TEMP/base/tools/read-col0-v2-replay.py" --team-fixtures > "$out"
+          printf '%s\n' '[2,[5,5,5,5,5,5],-1]' | cmp -s - "$out"
+          cat "$out"
+  private:
+    if: inputs.diagnostic == 'col0-v2' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    environment: col0-v2-private
+    permissions: {}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - *checkout
+      - name: Release the frozen private v2 histogram
+        env:
+          COL0_V2_RECEIPTS: ${{ github.sha == vars.COL0_V2_BASE && secrets.COL0_V2_RECEIPTS || '' }}
+        run: python3 -I -B -S "$RUNNER_TEMP/base/tools/read-col0-v2-replay.py"
