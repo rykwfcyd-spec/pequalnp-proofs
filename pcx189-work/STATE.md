@@ -23,3 +23,12 @@ Deliverable: line sequence (rule + premise line numbers) + own checker PASS, pos
 - v2: segment SAT (axioms -> units ~x00,~x01,~x02), tighter pool (~1.6k), pruned hyperedges
   (andIntro only when premises share a term; cut result <= max premise terms + 1).
   Segment budget 25 -> total 22 + 25 + 3 final = 50.
+
+## Outcome (2026-11-28 18:3x JST) — reported to Issue #39 before the 19:30 deadline
+- No <=50-line refutation found within the deadline. Best verified: 55 (L_pcx_191, replayed PASS in my checker).
+- 191 DAG audit: no duplicate lines, no unused lines — no free savings.
+- Segment SAT (axioms -> 3 units, T=25 => total 50): encoding built (pool 1235, hyperedges 102118,
+  195,953 vars / 5,198,238 clauses) but Glucose3 did not reach a verdict: two runtime restarts
+  plus slow shared CPU. Neither SAT nor UNSAT — no conclusion. Encoding/scripts preserved here
+  and on fork branch muse/pcx189-work (pcx189-work/); re-running resume_solve.py in an
+  uninterrupted environment settles T=25, then 24/23.
